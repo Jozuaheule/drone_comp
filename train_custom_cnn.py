@@ -82,36 +82,68 @@ class CustomCNN(nn.Module):
         x = self.fc2(x)
         return x.reshape(-1, self.S, self.S, 5)
 
+from torchvision.ops import sigmoid_focal_loss, complete_box_iou_loss
+
 class CustomLoss(nn.Module):
-    def __init__(self, grid_size=7, lambda_coord=5, lambda_noobj=0.5):
+    def __init__(self, grid_size=7, lambda_coord=5, lambda_noobj=0.5, lambda_corner=0.1):
         super(CustomLoss, self).__init__()
         self.S = grid_size
         self.lambda_coord = lambda_coord
         self.lambda_noobj = lambda_noobj
-        self.mse = nn.MSELoss(reduction='sum')
+        self.lambda_corner = lambda_corner
+        self.l1 = nn.L1Loss(reduction='mean')
 
     def forward(self, predictions, target):
         exists_box = target[..., 0] == 1
         no_exists_box = target[..., 0] == 0
 
-        # Confidence loss
+        # Confidence loss (Focal Loss)
         box_preds = predictions[exists_box]
         box_targets = target[exists_box]
-        obj_loss = self.mse(box_preds[:, 0], box_targets[:, 0])
+        obj_loss = sigmoid_focal_loss(box_preds[:, 0], box_targets[:, 0], reduction='mean')
 
         noobj_preds = predictions[no_exists_box]
         noobj_targets = target[no_exists_box]
-        noobj_loss = self.mse(noobj_preds[:, 0], noobj_targets[:, 0])
+        noobj_loss = sigmoid_focal_loss(noobj_preds[:, 0], noobj_targets[:, 0], reduction='mean')
 
-        # Box coordinates loss
+        # Box coordinates loss (CIoU)
         box_preds_coords = box_preds[:, 1:5]
         box_targets_coords = box_targets[:, 1:5]
-        coord_loss = self.mse(box_preds_coords, box_targets_coords)
+
+        # Ensure width and height are non-negative and non-zero
+        w_pred = torch.abs(box_preds_coords[..., 2]) + 1e-6
+        h_pred = torch.abs(box_preds_coords[..., 3]) + 1e-6
+        x_pred = box_preds_coords[..., 0]
+        y_pred = box_preds_coords[..., 1]
+
+        w_targ = box_targets_coords[..., 2]
+        h_targ = box_targets_coords[..., 3]
+        x_targ = box_targets_coords[..., 0]
+        y_targ = box_targets_coords[..., 1]
+
+        # Convert to (x1, y1, x2, y2) format for CIoU loss
+        box_preds_x1y1x2y2 = torch.zeros_like(box_preds_coords)
+        box_preds_x1y1x2y2[..., 0] = x_pred - w_pred / 2
+        box_preds_x1y1x2y2[..., 1] = y_pred - h_pred / 2
+        box_preds_x1y1x2y2[..., 2] = x_pred + w_pred / 2
+        box_preds_x1y1x2y2[..., 3] = y_pred + h_pred / 2
+        
+        box_targets_x1y1x2y2 = torch.zeros_like(box_targets_coords)
+        box_targets_x1y1x2y2[..., 0] = x_targ - w_targ / 2
+        box_targets_x1y1x2y2[..., 1] = y_targ - h_targ / 2
+        box_targets_x1y1x2y2[..., 2] = x_targ + w_targ / 2
+        box_targets_x1y1x2y2[..., 3] = y_targ + h_targ / 2
+
+        ciou_loss = torch.mean(complete_box_iou_loss(box_preds_x1y1x2y2, box_targets_x1y1x2y2))
+
+        # Corner loss
+        corner_loss = self.l1(box_preds_x1y1x2y2, box_targets_x1y1x2y2)
 
         total_loss = (
-            self.lambda_coord * coord_loss
+            self.lambda_coord * ciou_loss
             + obj_loss
             + self.lambda_noobj * noobj_loss
+            + self.lambda_corner * corner_loss
         )
         return total_loss
 
@@ -130,6 +162,8 @@ def main():
 
     data_transforms = transforms.Compose([
         transforms.Resize((480, 640)),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+        transforms.RandomRotation(10),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
 
@@ -138,7 +172,7 @@ def main():
 
     # Create a random subset for training
     total_size = len(full_dataset)
-    subset_indices = np.random.choice(total_size, 200, replace=False)
+    subset_indices = np.random.choice(total_size, 50, replace=False)
     subset = torch.utils.data.Subset(full_dataset, subset_indices)
 
     # Create training and validation sets
@@ -150,10 +184,10 @@ def main():
     val_loader = DataLoader(val_set, batch_size=4, shuffle=False)
 
     model = CustomCNN().to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=2e-5)
+    optimizer = torch.optim.Adam(model.parameters(), lr=2e-6)
     loss_fn = CustomLoss()
 
-    num_epochs = 20
+    num_epochs = 10
     best_val_loss = float('inf')
     
     patience = 5
